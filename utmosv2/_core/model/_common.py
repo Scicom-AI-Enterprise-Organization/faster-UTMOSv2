@@ -43,6 +43,7 @@ class UTMOSv2ModelMixin(abc.ABC):
         num_workers: int = ...,
         batch_size: int = ...,
         num_repetitions: int = ...,
+        num_frames: int | None = ...,
         remove_silent_section: bool = ...,
         verbose: bool = ...,
     ) -> ArrayLike: ...
@@ -58,6 +59,7 @@ class UTMOSv2ModelMixin(abc.ABC):
         num_workers: int = ...,
         batch_size: int = ...,
         num_repetitions: int = ...,
+        num_frames: int | None = ...,
         remove_silent_section: bool = ...,
         verbose: bool = ...,
     ) -> float: ...
@@ -73,6 +75,7 @@ class UTMOSv2ModelMixin(abc.ABC):
         num_workers: int = ...,
         batch_size: int = ...,
         num_repetitions: int = ...,
+        num_frames: int | None = ...,
         remove_silent_section: bool = ...,
         verbose: bool = ...,
     ) -> list[dict[str, str | float]]: ...
@@ -90,6 +93,7 @@ class UTMOSv2ModelMixin(abc.ABC):
         num_workers: int = 4,
         batch_size: int = 16,
         num_repetitions: int = 1,
+        num_frames: int | None = None,
         remove_silent_section: bool = True,
         verbose: bool = True,
     ) -> torch.Tensor | np.ndarray | float | list[dict[str, str | float]]:
@@ -121,6 +125,11 @@ class UTMOSv2ModelMixin(abc.ABC):
                 Batch size for the data loader. Defaults to 16.
             num_repetitions (int):
                 Number of prediction repetitions to average results. Defaults to 1.
+            num_frames (int | None):
+                Override the number of spectrogram frames per sample. When set to 1
+                (instead of the default 2), EfficientNetV2 processes 8 images/batch
+                instead of 64, giving ~4.7× GPU speedup with a minor accuracy trade-off.
+                Set to None to use the value from the model config. Defaults to None.
             remove_silent_section (bool):
                 Whether to remove silent sections from the audio before prediction. Defaults to True.
             verbose (bool):
@@ -149,20 +158,32 @@ class UTMOSv2ModelMixin(abc.ABC):
         # See these issues for more details:
         # - https://github.com/sarulab-speech/UTMOSv2/issues/56
         # - https://github.com/sarulab-speech/UTMOSv2/issues/73
-        initial_state = getattr(self._cfg.dataset, "remove_silent_section", None)
+        initial_rss = getattr(self._cfg.dataset, "remove_silent_section", None)
         self._cfg.dataset.remove_silent_section = remove_silent_section
+        # Temporarily override num_frames for speed/accuracy trade-off at inference time.
+        # num_frames=1 reduces EfficientNetV2 from 64 to 8 images/batch (~4.7x GPU speedup).
+        spec_frames = getattr(self._cfg.dataset, "spec_frames", None)
+        initial_num_frames = getattr(spec_frames, "num_frames", None) if spec_frames is not None else None
+        if num_frames is not None and spec_frames is not None:
+            spec_frames.num_frames = num_frames
         dataset = get_dataset(self._cfg, data_internal, self._cfg.phase)
-        self._cfg.dataset.remove_silent_section = initial_state
+        self._cfg.dataset.remove_silent_section = initial_rss
+        if num_frames is not None and spec_frames is not None:
+            spec_frames.num_frames = initial_num_frames
 
-        # Use 0 workers for small datasets — worker spawn overhead dominates
-        # when there are fewer items than workers.
-        effective_workers = 0 if len(dataset) <= num_workers else num_workers
+        # Spawn workers only when there are enough batches to amortise the
+        # ~1-2 s process-startup cost.  We need at least one full batch per
+        # worker; otherwise in-process loading is faster.
+        effective_workers = (
+            0 if len(dataset) <= batch_size * max(1, num_workers) else num_workers
+        )
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
             num_workers=effective_workers,
             pin_memory=True,
+            prefetch_factor=4 if effective_workers > 0 else None,
         )
 
         pred = self._predict_impl(dataloader, num_repetitions, device, verbose)
@@ -177,6 +198,51 @@ class UTMOSv2ModelMixin(abc.ABC):
                 {"file_path": d.file_path.as_posix(), "predicted_mos": float(p)}
                 for d, p in zip(data_internal, pred)
             ]
+
+    def warmup(
+        self,
+        device: str | torch.device = "cuda:0",
+        batch_size: int = 1,
+    ) -> None:
+        """Pre-initialize CUDA and cuDNN by running a dummy inference pass.
+
+        On the first real inference, cuDNN spends 3–5 s benchmarking convolution
+        algorithms for EfficientNetV2's many layers. Calling ``warmup()`` once
+        after ``create_model()`` pays that cost up front so subsequent
+        ``predict()`` calls start fast.
+
+        Args:
+            device: Device to run the warmup on.
+            batch_size: Number of dummy samples to run. Pass the same value
+                you will use for inference so cuDNN tunes for that exact batch
+                shape (default 1 covers single-file use; use your inference
+                ``batch_size`` for directory-level throughput).
+
+        Example::
+
+            model = utmosv2.create_model()
+            model.warmup(batch_size=8)   # ~5 s once
+            scores = model.predict(input_dir=..., batch_size=8)  # fast from here
+        """
+        import os
+        import tempfile
+
+        import soundfile as sf
+
+        dummy = np.zeros(self._cfg.sr, dtype=np.float32)  # 1 s of silence
+        if batch_size <= 1:
+            self.predict(data=dummy, device=device, verbose=False)
+        else:
+            with tempfile.TemporaryDirectory() as tmp:
+                for i in range(batch_size):
+                    sf.write(os.path.join(tmp, f"_warmup_{i}.wav"), dummy, self._cfg.sr)
+                self.predict(
+                    input_dir=Path(tmp),
+                    device=device,
+                    batch_size=batch_size,
+                    num_workers=0,
+                    verbose=False,
+                )
 
     def _prepare_data(
         self,

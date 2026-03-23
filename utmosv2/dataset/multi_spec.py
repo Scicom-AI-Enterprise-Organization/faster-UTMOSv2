@@ -81,7 +81,7 @@ class MultiSpecDataset(BaseDataset):
                     spec = _make_melspec_torch(y1_t, mel_t, spec_cfg)
                 else:
                     spec = _make_spctrogram(self.cfg, spec_cfg, y1)
-                if self.cfg.dataset.spec_frames.mixup_inner:
+                if self.cfg.dataset.spec_frames.mixup_inner and self.phase == "train":
                     y2 = select_random_start(y, length)
                     y2_t = torch.from_numpy(y2).unsqueeze(0)
                     if mel_t is not None:

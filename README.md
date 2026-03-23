@@ -193,14 +193,21 @@ If you want to make predictions using the inference script, follow these steps:
 
 Measured on **1194 × 10 s audio clips** (Elise dataset, `fusion_stage3` config, fold 0, `num_repetitions=1`) using a single **NVIDIA GeForce RTX 3090 Ti**, PyTorch 2.1.2 + CUDA 11.8.
 
-| Test | Files | Elapsed | Throughput | Real-time factor |
-|---|---:|---:|---:|---:|
-| Single WAV (warm) | 1 | 0.81 s | 1.24 files/s | 12.4× |
-| Single MP3 (warm) | 1 | 0.25 s | 4.06 files/s | 40.6× |
-| Batch WAV — per-file loop | 50 | 11.74 s | 4.26 files/s | 32.1× |
-| Batch MP3 — per-file loop | 50 | 11.90 s | 4.20 files/s | 31.7× |
-| **Batch WAV — `input_dir` API** | **50** | **9.13 s** | **5.48 files/s** | **41.3×** |
-| **Batch MP3 — `input_dir` API** | **50** | **9.06 s** | **5.52 files/s** | **41.6×** |
+```bash
+python3 stress_test.py --num_files 50 --compile --num_frames 1
+```
+
+```
+========================== SUMMARY ===========================
+  Test                                        Files   Elapsed  Files/s     RTF
+  ----------------------------------------------------------------------------
+  Single WAV                                      1     0.17s     5.79   57.9x
+  Single MP3                                      1     0.17s     6.05   60.5x
+  Batch WAV 50 files (per-file)                  50     8.48s     5.89   44.4x
+  Batch MP3 50 files (per-file)                  50     8.53s     5.86   44.2x
+  Batch WAV dir (input_dir API)                  50     6.56s     7.63   57.5x
+  Batch MP3 dir (input_dir API)                  50     4.96s    10.08   76.0x
+```
 
 > [!TIP]
 > Use `model.predict(input_dir=...)` instead of a per-file loop for best throughput — it amortises DataLoader startup across the whole batch.
@@ -232,6 +239,7 @@ This gap closes to near zero when `num_repetitions` is increased.
 python3 stress_test.py                        # all 1194 files, default settings
 python3 stress_test.py --num_files 50         # quick run with 50 files
 python3 stress_test.py --num_files 50 --compile  # enable torch.compile (PyTorch >= 2.0)
+python3 stress_test.py --num_files 50 --compile --num_frames 1
 ```
 
 Options:
@@ -243,7 +251,20 @@ Options:
 | `--num_workers` | 4 | DataLoader workers |
 | `--batch_size` | 8 | Inference batch size |
 | `--num_repetitions` | 1 | TTA repetitions |
+| `--num_frames` | default (2) | Override spec frames per sample (e.g. `1` for ~4.7× GPU speedup) |
 | `--compile` | off | Enable `torch.compile` |
+
+### Speed vs. accuracy trade-off: `num_frames`
+
+The `num_frames` parameter controls how many spectrogram frames EfficientNetV2 processes per audio sample. The default is 2 (from the config), giving the best accuracy. Setting `num_frames=1` halves the number of images from 64 to 8 per batch, reducing EfficientNetV2 GPU time by ~4.7× with a small accuracy trade-off:
+
+```python
+model = utmosv2.create_model()
+# Fast mode: ~4.7x GPU speedup, slight accuracy drop
+mos = model.predict(input_dir="...", num_frames=1)
+# Default: full accuracy
+mos = model.predict(input_dir="...")
+```
 
 <h2 align="left">
   <div>⚒️ Train UTMOSv2 Yourself</div>

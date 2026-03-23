@@ -35,6 +35,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--num_workers", type=int, default=4)
     parser.add_argument("--batch_size", type=int, default=8)
     parser.add_argument("--num_repetitions", type=int, default=1)
+    parser.add_argument("--num_frames", type=int, default=None,
+                        help="Override spec_frames.num_frames (e.g. 1 for ~4.7x GPU speedup)")
     parser.add_argument("--compile", action="store_true",
                         help="Enable torch.compile on the model (requires PyTorch >= 2.0)")
     return parser.parse_args()
@@ -72,6 +74,7 @@ def predict_single(model, f, args, device):
         num_workers=args.num_workers,
         batch_size=args.batch_size,
         num_repetitions=args.num_repetitions,
+        num_frames=args.num_frames,
         verbose=False,
     )
 
@@ -119,6 +122,7 @@ def bench_dir(
         num_workers=args.num_workers,
         batch_size=args.batch_size,
         num_repetitions=args.num_repetitions,
+        num_frames=args.num_frames,
         verbose=True,
     )
     elapsed = time.perf_counter() - t0
@@ -157,11 +161,23 @@ def main() -> None:
     print(f"\nDevice     : {device}")
     print(f"WAV files  : {len(wav_files)}")
     print(f"MP3 files  : {len(mp3_files)}")
+    print(f"num_frames : {args.num_frames if args.num_frames is not None else 'default (2)'}")
     print(f"compile    : {args.compile}\n")
 
     print("Loading model...")
     model = utmosv2.create_model(compile=args.compile)
     print()
+
+    # ── Warmup (pre-initialise CUDA / cuDNN) ───────────────────────────────
+    # Run at both batch_size=1 (single-file) and the bulk batch_size so cuDNN
+    # tunes its convolution algorithms for both shapes up front.
+    sep("Warmup — pre-initialise CUDA/cuDNN")
+    t0 = time.perf_counter()
+    model.warmup(device=device, batch_size=1)                # single-file shape
+    model.warmup(device=device, batch_size=args.batch_size)  # bulk inference shape
+    t_warmup = time.perf_counter() - t0
+    print(f"  Warmup time : {t_warmup:.2f}s  (paid once — subsequent calls are fast)")
+    print(f"  Shapes tuned: batch=1 (single file) + batch={args.batch_size} (bulk)\n")
 
     summary = []
 
