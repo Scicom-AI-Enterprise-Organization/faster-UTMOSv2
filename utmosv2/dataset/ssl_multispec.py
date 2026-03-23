@@ -2,10 +2,13 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+import numpy as np
 import torch
 
 from utmosv2.dataset import MultiSpecDataset, SSLExtDataset
 from utmosv2.dataset._base import BaseDataset
+from utmosv2.dataset._utils import extend_audio, select_random_start
+from utmosv2.dataset.multi_spec import _make_melspec_torch, _make_spctrogram
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -55,7 +58,49 @@ class SSLLMultiSpecExtDataset(BaseDataset):
             tuple: data for SSL feature extractor (torch.Tensor), data for mel-spectrogram feature extractor (torch.Tensor),
             data-domain id (torch.Tensor), and target MOS (torch.Tensor).
         """
-        x1, d, target = self.ssl[idx]
-        x2, _ = self.multi_spec[idx]
+        # Load audio ONCE and share between SSL and spectrogram pipelines.
+        y, target = self._get_audio_and_mos(idx)
+
+        # SSL processing
+        ssl_length = int(self.cfg.dataset.ssl.duration * self.cfg.sr)
+        y_ssl = extend_audio(y, ssl_length, method="tile")
+        y_ssl = select_random_start(y_ssl, ssl_length)
+        x1 = torch.from_numpy(y_ssl)
+
+        # Domain embedding (via SSLExtDataset's DataDomainMixin)
+        d = self.ssl._get_data_domain_embedding(idx)
+
+        # MultiSpec processing (inlined from MultiSpecDataset.__getitem__)
+        specs = []
+        spec_length = int(self.cfg.dataset.spec_frames.frame_sec * self.cfg.sr)
+        y_spec = extend_audio(y, spec_length, method=self.cfg.dataset.spec_frames.extend)
+        for _ in range(self.cfg.dataset.spec_frames.num_frames):
+            y1 = select_random_start(y_spec, spec_length)
+            y1_t = torch.from_numpy(y1).unsqueeze(0)
+            for i, spec_cfg in enumerate(self.cfg.dataset.specs):
+                mel_t = self.multi_spec._mel_transforms.get(i)
+                if mel_t is not None:
+                    spec = _make_melspec_torch(y1_t, mel_t, spec_cfg)
+                else:
+                    spec = _make_spctrogram(self.cfg, spec_cfg, y1)
+                if self.cfg.dataset.spec_frames.mixup_inner:
+                    y2 = select_random_start(y_spec, spec_length)
+                    y2_t = torch.from_numpy(y2).unsqueeze(0)
+                    if mel_t is not None:
+                        spec2 = _make_melspec_torch(y2_t, mel_t, spec_cfg)
+                    else:
+                        spec2 = _make_spctrogram(self.cfg, spec_cfg, y2)
+                    lmd = np.random.beta(
+                        self.cfg.dataset.spec_frames.mixup_alpha,
+                        self.cfg.dataset.spec_frames.mixup_alpha,
+                    )
+                    spec = lmd * spec + (1 - lmd) * spec2
+                spec = np.stack([spec, spec, spec], axis=0)
+                spec_tensor = torch.tensor(spec, dtype=torch.float32)
+                phase = "train" if self.phase == "train" else "valid"
+                assert self.transform is not None, "Transform must be provided."
+                spec_tensor = self.transform[phase](spec_tensor)
+                specs.append(spec_tensor)
+        x2 = torch.stack(specs).float()
 
         return x1, x2, d, target

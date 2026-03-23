@@ -1,24 +1,26 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import TYPE_CHECKING
 
 import librosa
 import numpy as np
+import torchaudio
 
 if TYPE_CHECKING:
-    from pathlib import Path
-
     from utmosv2._settings._config import Config
 
 
 def load_audio(cfg: Config, file: Path) -> np.ndarray:
-    try:
-        y, sr = librosa.load(file, sr=None)
-        y = librosa.resample(y, orig_sr=sr, target_sr=cfg.sr)
-    except Exception:
-        y = np.load(file)
-    return y
+    if Path(file).suffix == ".npy":
+        return np.load(file)
+    waveform, sr = torchaudio.load(file)
+    if waveform.shape[0] > 1:
+        waveform = waveform.mean(dim=0, keepdim=True)
+    if sr != cfg.sr:
+        waveform = torchaudio.functional.resample(waveform, orig_freq=sr, new_freq=cfg.sr)
+    return waveform.squeeze(0).numpy()
 
 
 def extend_audio(y: np.ndarray, length: int, method: str) -> np.ndarray:

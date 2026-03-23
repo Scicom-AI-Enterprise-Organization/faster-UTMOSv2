@@ -47,9 +47,10 @@ def main(cfg: Config) -> None:
         cfg.print_config = False  # type: ignore
         print(f"+*+*[[Fold {fold + 1}/{cfg.num_folds}]]" + "+*" * 30)
 
+        test_dataset = get_dataset(cfg, data, "test")
+        test_dataloader = get_dataloader(cfg, test_dataset, "test")
+
         for cycle in range(cfg.inference.num_tta):
-            test_dataset = get_dataset(cfg, data, "test")
-            test_dataloader = get_dataloader(cfg, test_dataset, "test")
             test_preds_tta, test_metrics_tta = run_inference(
                 cfg, model, test_dataloader, cycle, data, device
             )

@@ -131,18 +131,21 @@ def get_inference_data(cfg: Config) -> pd.DataFrame:
         data = _get_testdata(cfg, data)
     else:
         if cfg.input_dir:
-            files = sorted(glob.glob(str(cfg.input_dir / "*.wav")))
+            files = sorted(
+                glob.glob(str(cfg.input_dir / "*.wav"))
+                + glob.glob(str(cfg.input_dir / "*.mp3"))
+            )
             data = pd.DataFrame({"file_path": files})
         else:
             data = pd.DataFrame({"file_path": [cfg.input_path.as_posix()]})
         data["utt_id"] = data["file_path"].apply(
-            lambda x: x.split("/")[-1].replace(".wav", "")
+            lambda x: Path(x).stem
         )
         data["file_path"] = data["file_path"].apply(lambda x: Path(x))
         data["sys_id"] = data["utt_id"].apply(lambda x: x.split("-")[0])
         if cfg.inference.val_list_path:
             with open(cfg.inference.val_list_path, "r") as f:
-                val_lists = [s.replace(".wav", "") for s in f.read().splitlines()]
+                val_lists = [Path(s).stem for s in f.read().splitlines()]
                 print(val_lists)
             data = data[data["utt_id"].isin(set(val_lists))]
         data["dataset"] = cfg.predict_dataset

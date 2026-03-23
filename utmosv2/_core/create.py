@@ -23,6 +23,7 @@ def create_model(
     checkpoint_path: Path | str | None = None,
     seed: int = 42,
     device: torch.device | str | Literal["auto"] = "auto",
+    compile: bool = False,
 ) -> UTMOSv2Model:
     """
     Create a UTMOSv2 model with the specified configuration and optional pretrained weights.
@@ -81,5 +82,8 @@ def create_model(
         )
         model.load_state_dict(torch.load(checkpoint_path, map_location=device))
         print(f"Loaded checkpoint from {checkpoint_path}")
+
+    if compile:
+        model = torch.compile(model)  # type: ignore[assignment]
 
     return model

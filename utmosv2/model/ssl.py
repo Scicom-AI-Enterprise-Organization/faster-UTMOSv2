@@ -23,13 +23,13 @@ class _SSLEncoder(nn.Module):
             for param in self.model.parameters():
                 param.requires_grad = False
 
-    def forward(self, x: tuple[torch.Tensor]) -> tuple[torch.Tensor]:
-        x = self.processor(
-            [t.cpu().numpy() for t in x],
-            sampling_rate=self.sr,
-            return_tensors="pt",
-        ).to(self.model.device)
-        outputs = self.model(**x, output_hidden_states=True)
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor]:
+        # Inline zero-mean unit-variance normalization on GPU, equivalent to
+        # AutoFeatureExtractor._zero_mean_unit_var_norm, avoiding CPU round-trips.
+        mean = x.mean(dim=-1, keepdim=True)
+        var = x.var(dim=-1, unbiased=False, keepdim=True)
+        x = (x - mean) / torch.sqrt(var + 1e-7)
+        outputs = self.model(input_values=x, output_hidden_states=True)
         return outputs.hidden_states
 
 

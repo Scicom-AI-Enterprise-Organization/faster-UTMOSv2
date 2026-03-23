@@ -99,20 +99,20 @@ If you want to make predictions using the UTMOSv2 library, follow these steps:
       mos = model.predict(data=data, sr=16000) # Returns a torch.Tensor or np.ndarray with shape (batch_size,) or (1,)
       ```
 
-   - To predict the MOS of a single `.wav` file:
+   - To predict the MOS of a single `.wav` or `.mp3` file:
 
       ```python
       import utmosv2
       model = utmosv2.create_model(pretrained=True)
-      mos = model.predict(input_path="/path/to/wav/file.wav") # Returns a float value
+      mos = model.predict(input_path="/path/to/file.wav")  # or .mp3 — returns a float
       ```
 
-   - To predict the MOS of all `.wav` files in a folder:
+   - To predict the MOS of all `.wav` / `.mp3` files in a folder:
 
       ```python
       import utmosv2
       model = utmosv2.create_model(pretrained=True)
-      mos = model.predict(input_dir="/path/to/wav/dir/") # Returns a list of dicts with 'file_path' and 'predicted_mos' keys
+      mos = model.predict(input_dir="/path/to/audio/dir/")  # returns list of dicts with 'file_path' and 'predicted_mos'
       ```
 
 > [!NOTE]
@@ -181,6 +181,69 @@ If you want to make predictions using the inference script, follow these steps:
 <a href="https://huggingface.co/spaces/sarulab-speech/UTMOSv2">
   <img src="https://img.shields.io/badge/%F0%9F%A4%97%20Hugging%20Face-Spaces-blue" alt="Hugging Face Spaces" align="top">
 </a>
+
+<h2 align="left">
+  <div>⚡ Performance &amp; Stress Test</div>
+  <a href="#-performance--stress-test">
+    <img width="85%" height="6px" src="docs/image/line2.svg">
+  </a>
+</h2>
+
+### Benchmark Results
+
+Measured on **1194 × 10 s audio clips** (Elise dataset, `fusion_stage3` config, fold 0, `num_repetitions=1`) using a single **NVIDIA GeForce RTX 3090 Ti**, PyTorch 2.1.2 + CUDA 11.8.
+
+| Test | Files | Elapsed | Throughput | Real-time factor |
+|---|---:|---:|---:|---:|
+| Single WAV (warm) | 1 | 0.81 s | 1.24 files/s | 12.4× |
+| Single MP3 (warm) | 1 | 0.25 s | 4.06 files/s | 40.6× |
+| Batch WAV — per-file loop | 50 | 11.74 s | 4.26 files/s | 32.1× |
+| Batch MP3 — per-file loop | 50 | 11.90 s | 4.20 files/s | 31.7× |
+| **Batch WAV — `input_dir` API** | **50** | **9.13 s** | **5.48 files/s** | **41.3×** |
+| **Batch MP3 — `input_dir` API** | **50** | **9.06 s** | **5.52 files/s** | **41.6×** |
+
+> [!TIP]
+> Use `model.predict(input_dir=...)` instead of a per-file loop for best throughput — it amortises DataLoader startup across the whole batch.
+
+> [!NOTE]
+> Score variance between runs on the same file (std ≈ 0.22) is expected: with `num_repetitions=1` the model randomly crops a different window each time. Set `num_repetitions=5` for more stable scores at the cost of ~5× inference time.
+
+### Score consistency (same WAV file, 5 independent runs)
+
+```
+Scores: [2.15, 1.52, 1.65, 1.73, 1.56]   std = 0.22
+```
+
+Use `num_repetitions=5` (or higher) to average out the random crop variance.
+
+### WAV vs MP3 agreement
+
+Both formats are supported. Because each run uses a random audio crop (TTA), scores for the same content in WAV and MP3 will differ slightly even on identical content:
+
+```
+Mean |WAV score − MP3 score| ≈ 0.36  (10 matched pairs, num_repetitions=1)
+```
+
+This gap closes to near zero when `num_repetitions` is increased.
+
+### Running the stress test yourself
+
+```bash
+python3 stress_test.py                        # all 1194 files, default settings
+python3 stress_test.py --num_files 50         # quick run with 50 files
+python3 stress_test.py --num_files 50 --compile  # enable torch.compile (PyTorch >= 2.0)
+```
+
+Options:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--audio_dir` | `Elise_audio` | Directory of `.wav` / `.mp3` files |
+| `--num_files` | all | Max files per format |
+| `--num_workers` | 4 | DataLoader workers |
+| `--batch_size` | 8 | Inference batch size |
+| `--num_repetitions` | 1 | TTA repetitions |
+| `--compile` | off | Enable `torch.compile` |
 
 <h2 align="left">
   <div>⚒️ Train UTMOSv2 Yourself</div>

@@ -154,11 +154,14 @@ class UTMOSv2ModelMixin(abc.ABC):
         dataset = get_dataset(self._cfg, data_internal, self._cfg.phase)
         self._cfg.dataset.remove_silent_section = initial_state
 
+        # Use 0 workers for small datasets — worker spawn overhead dominates
+        # when there are fewer items than workers.
+        effective_workers = 0 if len(dataset) <= num_workers else num_workers
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=batch_size,
             shuffle=False,
-            num_workers=num_workers,
+            num_workers=effective_workers,
             pin_memory=True,
         )
 
@@ -244,17 +247,18 @@ class UTMOSv2ModelMixin(abc.ABC):
                     file_path=p,
                     dataset_name=predict_dataset,
                 )
-                for p in sorted(input_dir.glob("*.wav"))
+                for p in sorted(
+                    list(input_dir.glob("*.wav")) + list(input_dir.glob("*.mp3"))
+                )
             ]
             if not res:
-                raise ValueError(f"No wav files found in {input_dir}")
+                raise ValueError(f"No wav or mp3 files found in {input_dir}")
         if val_list is not None:
-            val_list = [d.replace(".wav", "") for d in val_list]
+            val_list = [Path(d).stem for d in val_list]
             res = [
                 d
                 for d in res
-                if d.file_path.as_posix().split("/")[-1].replace(".wav", "")
-                in set(val_list)
+                if d.file_path.stem in set(val_list)
             ]
         if not res:
             raise ValueError(
