@@ -83,9 +83,9 @@ If you want to make predictions using the UTMOSv2 library, follow these steps:
 1. Install the UTMOSv2 library from GitHub
 
    ```bash
-   uv add git+https://github.com/Scicom-AI-Enterprise-Organization/UTMOSv2
+   uv add git+https://github.com/Scicom-AI-Enterprise-Organization/faster-UTMOSv2
    # If you're using pip:
-   # pip install git+https://github.com/Scicom-AI-Enterprise-Organization/UTMOSv2
+   # pip install git+https://github.com/Scicom-AI-Enterprise-Organization/faster-UTMOSv2
    ```
 
 2. Make predictions
@@ -133,7 +133,7 @@ If you want to make predictions using the inference script, follow these steps:
 1. Clone this repository and navigate to UTMOSv2 folder
 
    ```bash
-   git clone https://github.com/Scicom-AI-Enterprise-Organization/UTMOSv2
+   git clone https://github.com/Scicom-AI-Enterprise-Organization/faster-UTMOSv2
    cd UTMOSv2
    ```
 
