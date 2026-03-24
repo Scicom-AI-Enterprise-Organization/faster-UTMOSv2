@@ -79,37 +79,37 @@ class MultiSpecDataset(BaseDataset):
             tuple: The spectrogram (torch.Tensor) and target MOS (torch.Tensor) for the sample.
         """
         y, target = self._get_audio_and_mos(idx)
-        specs = []
         length = int(self.cfg.dataset.spec_frames.frame_sec * self.cfg.sr)
         y = extend_audio(y, length, method=self.cfg.dataset.spec_frames.extend)
-        for _ in range(self.cfg.dataset.spec_frames.num_frames):
+        num_frames = self.cfg.dataset.spec_frames.num_frames
+        mixup_inner = self.cfg.dataset.spec_frames.mixup_inner
+        mixup_alpha = self.cfg.dataset.spec_frames.mixup_alpha
+        phase_key = "train" if self.phase == "train" else "valid"
+
+        assert self.transform is not None
+        specs = []
+        for _ in range(num_frames):
             y1 = select_random_start(y, length)
-            y1_t = torch.from_numpy(y1).unsqueeze(0)
+            y2 = select_random_start(y, length) if mixup_inner else None
             for i, spec_cfg in enumerate(self.cfg.dataset.specs):
                 mel_fb = self._mel_filters.get(i)
                 stft_t = self._stft_transforms.get(i)
                 if mel_fb is not None and stft_t is not None:
-                    spec = _make_melspec_fast(y1_t, stft_t, mel_fb, spec_cfg)
+                    y1_t = torch.from_numpy(y1).unsqueeze(0)
+                    s = _make_melspec_fast(y1_t, stft_t, mel_fb, spec_cfg)
+                    if y2 is not None:
+                        y2_t = torch.from_numpy(y2).unsqueeze(0)
+                        s2 = _make_melspec_fast(y2_t, stft_t, mel_fb, spec_cfg)
+                        lmd = np.random.beta(mixup_alpha, mixup_alpha)
+                        s = lmd * s + (1 - lmd) * s2
                 else:
-                    spec = _make_spctrogram(self.cfg, spec_cfg, y1)
-                if self.cfg.dataset.spec_frames.mixup_inner:
-                    y2 = select_random_start(y, length)
-                    y2_t = torch.from_numpy(y2).unsqueeze(0)
-                    if mel_fb is not None and stft_t is not None:
-                        spec2 = _make_melspec_fast(y2_t, stft_t, mel_fb, spec_cfg)
-                    else:
-                        spec2 = _make_spctrogram(self.cfg, spec_cfg, y2)
-                    lmd = np.random.beta(
-                        self.cfg.dataset.spec_frames.mixup_alpha,
-                        self.cfg.dataset.spec_frames.mixup_alpha,
-                    )
-                    spec = lmd * spec + (1 - lmd) * spec2
-                spec = np.stack([spec, spec, spec], axis=0)
-                spec_tensor = torch.tensor(spec, dtype=torch.float32)
-                phase = "train" if self.phase == "train" else "valid"
-                assert self.transform is not None, "Transform must be provided."
-                spec_tensor = self.transform[phase](spec_tensor)
-                specs.append(spec_tensor)
+                    s = _make_spctrogram(self.cfg, spec_cfg, y1)
+                    if y2 is not None:
+                        s2 = _make_spctrogram(self.cfg, spec_cfg, y2)
+                        lmd = np.random.beta(mixup_alpha, mixup_alpha)
+                        s = lmd * s + (1 - lmd) * s2
+                s_t = torch.tensor(np.stack([s, s, s]), dtype=torch.float32)
+                specs.append(self.transform[phase_key](s_t))
         spec_tensor = torch.stack(specs).float()
 
         return spec_tensor, target

@@ -191,22 +191,22 @@ If you want to make predictions using the inference script, follow these steps:
 
 ### Benchmark Results
 
-Measured on **1194 × 10 s audio clips** (Elise dataset, `fusion_stage3` config, fold 0, `num_repetitions=1`) using a single **NVIDIA GeForce RTX 3090 Ti**, PyTorch 2.1.2 + CUDA 11.8.
+Measured on **50 × 7.5 s audio clips** (Elise dataset, `fusion_stage3` config, fold 0, `num_repetitions=1`) using a single **NVIDIA GeForce RTX 3090 Ti**, PyTorch 2.8.0 + CUDA 12.8.
 
 ```bash
-python3 stress_test.py --num_files 50 --compile --num_frames 1
+python3 stress_test.py --num_files 50
 ```
 
 ```
 ========================== SUMMARY ===========================
   Test                                        Files   Elapsed  Files/s     RTF
   ----------------------------------------------------------------------------
-  Single WAV                                      1     0.27s     3.70   37.0x
-  Single MP3                                      1     0.27s     3.66   36.6x
-  Batch WAV 50 files (per-file)                  50    13.54s     3.69   27.8x
-  Batch MP3 50 files (per-file)                  50    13.99s     3.57   26.9x
-  Batch WAV dir (input_dir API)                  50    10.64s     4.70   35.4x
-  Batch MP3 dir (input_dir API)                  50     8.84s     5.66   42.6x
+  Single WAV                                      1     0.26s     3.90   39.0x
+  Single MP3                                      1     0.26s     3.85   38.5x
+  Batch WAV 50 files (per-file)                  50    12.81s     3.90   29.4x
+  Batch MP3 50 files (per-file)                  50    13.55s     3.69   27.8x
+  Batch WAV dir (input_dir API)                  50     9.69s     5.16   38.9x
+  Batch MP3 dir (input_dir API)                  50     8.33s     6.00   45.3x
 ```
 
 > [!TIP]

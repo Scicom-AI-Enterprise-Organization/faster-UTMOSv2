@@ -90,8 +90,8 @@ class UTMOSv2ModelMixin(abc.ABC):
         val_list_path: Path | str | None = None,
         predict_dataset: str = "sarulab",
         device: str | torch.device = "cuda:0",
-        num_workers: int = 4,
-        batch_size: int = 16,
+        num_workers: int = -1,
+        batch_size: int = 8,
         num_repetitions: int = 1,
         num_frames: int | None = None,
         remove_silent_section: bool = True,
@@ -120,9 +120,12 @@ class UTMOSv2ModelMixin(abc.ABC):
             device (str | torch.device):
                 Device to use for prediction (e.g., "cuda:0" or "cpu"). Defaults to "cuda:0".
             num_workers (int):
-                Number of workers for data loading. Defaults to 4.
+                Number of workers for data loading. Use -1 (default) to
+                auto-select based on CPU count (``min(8, cpu_count // 2)``).
             batch_size (int):
-                Batch size for the data loader. Defaults to 16.
+                Batch size for the data loader. Defaults to 8. Smaller
+                batches improve throughput because WavLM becomes memory-bound
+                at batch_size ≥ 16 on typical GPUs.
             num_repetitions (int):
                 Number of prediction repetitions to average results. Defaults to 1.
             num_frames (int | None):
@@ -142,6 +145,10 @@ class UTMOSv2ModelMixin(abc.ABC):
         Raises:
             ValueError: If both `input_path` and `input_dir` are provided, or if neither is provided.
         """
+        if num_workers < 0:
+            import os
+            # Use up to 12 workers; cap at cpu_count to avoid over-subscription.
+            num_workers = min(12, os.cpu_count() or 4)
         data_internal = self._prepare_data(
             data,
             sr,
@@ -171,12 +178,18 @@ class UTMOSv2ModelMixin(abc.ABC):
         if num_frames is not None and spec_frames is not None:
             spec_frames.num_frames = initial_num_frames
 
-        # Spawn workers only when there are enough batches to amortise the
-        # ~1-2 s process-startup cost.  We need at least one full batch per
-        # worker; otherwise in-process loading is faster.
+        # Spawn workers when there are enough batches to amortise process-startup
+        # cost (~1-2 s).  Workers pipeline STFT computation with GPU inference,
+        # so even 2+ batches worth of data benefits from parallelism.
         effective_workers = (
-            0 if len(dataset) <= batch_size * max(1, num_workers) else num_workers
+            0 if len(dataset) <= batch_size * 2 else num_workers
         )
+
+        def _worker_init_fn(worker_id: int) -> None:
+            # Each DataLoader worker should use a single torch thread to avoid
+            # N-workers × N-threads CPU core contention during STFT computation.
+            torch.set_num_threads(1)
+
         dataloader = torch.utils.data.DataLoader(
             dataset,
             batch_size=batch_size,
@@ -184,6 +197,8 @@ class UTMOSv2ModelMixin(abc.ABC):
             num_workers=effective_workers,
             pin_memory=True,
             prefetch_factor=4 if effective_workers > 0 else None,
+            worker_init_fn=_worker_init_fn if effective_workers > 0 else None,
+            persistent_workers=effective_workers > 0,
         )
 
         pred = self._predict_impl(dataloader, num_repetitions, device, verbose)
