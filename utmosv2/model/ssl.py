@@ -24,8 +24,8 @@ class _SSLEncoder(nn.Module):
                 param.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor]:
-        # Inline zero-mean unit-variance normalization on GPU, equivalent to
-        # AutoFeatureExtractor._zero_mean_unit_var_norm, avoiding CPU round-trips.
+        # Inline zero-mean unit-variance normalisation on GPU — same math as
+        # AutoFeatureExtractor._zero_mean_unit_var_norm, avoids CPU round-trip.
         mean = x.mean(dim=-1, keepdim=True)
         var = x.var(dim=-1, unbiased=False, keepdim=True)
         x = (x - mean) / torch.sqrt(var + 1e-7)

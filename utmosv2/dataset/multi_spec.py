@@ -43,20 +43,30 @@ class MultiSpecDataset(BaseDataset):
         transform: dict[str, Callable[[torch.Tensor], torch.Tensor]] | None = None,
     ) -> None:
         super().__init__(cfg, data, phase, transform)
-        # Pre-create mel transforms once so filter banks are computed only at init,
-        # not on every __getitem__ call.
-        self._mel_transforms: dict[int, torchaudio.transforms.MelSpectrogram] = {
-            i: torchaudio.transforms.MelSpectrogram(
-                sample_rate=cfg.sr,
-                n_fft=spec_cfg.n_fft,
-                hop_length=spec_cfg.hop_length,
-                n_mels=spec_cfg.n_mels,
-                win_length=spec_cfg.win_length,
-                power=2.0,
-            )
-            for i, spec_cfg in enumerate(cfg.dataset.specs)
-            if spec_cfg.mode == "melspec"
-        }
+        # Pre-cache mel filter banks (computed with librosa for exact match) and
+        # torchaudio power spectrograms (faster torch FFT than librosa/scipy).
+        self._mel_filters: dict[int, torch.Tensor] = {}
+        self._stft_transforms: dict[int, torchaudio.transforms.Spectrogram] = {}
+        for i, spec_cfg in enumerate(cfg.dataset.specs):
+            if spec_cfg.mode == "melspec":
+                fb = librosa.filters.mel(
+                    sr=cfg.sr,
+                    n_fft=spec_cfg.n_fft,
+                    n_mels=spec_cfg.n_mels,
+                    fmin=0.0,
+                    fmax=None,
+                    htk=False,
+                    norm="slaney",  # librosa 0.9 default
+                )
+                self._mel_filters[i] = torch.from_numpy(fb).float()  # [n_mels, n_fft//2+1]
+                self._stft_transforms[i] = torchaudio.transforms.Spectrogram(
+                    n_fft=spec_cfg.n_fft,
+                    hop_length=spec_cfg.hop_length,
+                    win_length=spec_cfg.win_length,
+                    power=2.0,
+                    center=True,
+                    pad_mode="constant",  # match librosa 0.9 melspectrogram default
+                )
 
     def __getitem__(self, idx: int) -> tuple[torch.Tensor, ...]:
         """
@@ -74,18 +84,19 @@ class MultiSpecDataset(BaseDataset):
         y = extend_audio(y, length, method=self.cfg.dataset.spec_frames.extend)
         for _ in range(self.cfg.dataset.spec_frames.num_frames):
             y1 = select_random_start(y, length)
-            y1_t = torch.from_numpy(y1).unsqueeze(0)  # [1, T]
+            y1_t = torch.from_numpy(y1).unsqueeze(0)
             for i, spec_cfg in enumerate(self.cfg.dataset.specs):
-                mel_t = self._mel_transforms.get(i)
-                if mel_t is not None:
-                    spec = _make_melspec_torch(y1_t, mel_t, spec_cfg)
+                mel_fb = self._mel_filters.get(i)
+                stft_t = self._stft_transforms.get(i)
+                if mel_fb is not None and stft_t is not None:
+                    spec = _make_melspec_fast(y1_t, stft_t, mel_fb, spec_cfg)
                 else:
                     spec = _make_spctrogram(self.cfg, spec_cfg, y1)
-                if self.cfg.dataset.spec_frames.mixup_inner and self.phase == "train":
+                if self.cfg.dataset.spec_frames.mixup_inner:
                     y2 = select_random_start(y, length)
                     y2_t = torch.from_numpy(y2).unsqueeze(0)
-                    if mel_t is not None:
-                        spec2 = _make_melspec_torch(y2_t, mel_t, spec_cfg)
+                    if mel_fb is not None and stft_t is not None:
+                        spec2 = _make_melspec_fast(y2_t, stft_t, mel_fb, spec_cfg)
                     else:
                         spec2 = _make_spctrogram(self.cfg, spec_cfg, y2)
                     lmd = np.random.beta(
@@ -160,6 +171,29 @@ def _make_melspec_torch(
     # power_to_db with ref=max: 10 * log10(spec / max(spec))
     log_spec = 10.0 * power_spec.clamp(min=1e-10).log10()
     log_spec -= log_spec.max()
+    spec = log_spec.numpy()
+    if getattr(spec_cfg, "norm", None) is not None:
+        spec = (spec + spec_cfg.norm) / spec_cfg.norm
+    return spec
+
+
+def _make_melspec_fast(
+    y_tensor: torch.Tensor,
+    stft_transform: torchaudio.transforms.Spectrogram,
+    mel_filter: torch.Tensor,
+    spec_cfg: object,
+) -> np.ndarray:
+    """Mel spectrogram using torchaudio STFT + pre-cached librosa filter bank.
+
+    Numerically equivalent to librosa.feature.melspectrogram + power_to_db(ref=max)
+    while reusing the filter bank computed once at dataset init.
+    """
+    with torch.no_grad():
+        power_spec = stft_transform(y_tensor).squeeze(0)  # [n_fft//2+1, T]
+        mel_spec = torch.matmul(mel_filter, power_spec)    # [n_mels, T]
+    log_spec = 10.0 * mel_spec.clamp(min=1e-10).log10()
+    log_spec -= log_spec.max()
+    log_spec = log_spec.clamp(min=-80.0)   # match librosa power_to_db(top_db=80) default
     spec = log_spec.numpy()
     if getattr(spec_cfg, "norm", None) is not None:
         spec = (spec + spec_cfg.norm) / spec_cfg.norm

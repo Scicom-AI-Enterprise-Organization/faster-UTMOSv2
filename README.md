@@ -201,12 +201,12 @@ python3 stress_test.py --num_files 50 --compile --num_frames 1
 ========================== SUMMARY ===========================
   Test                                        Files   Elapsed  Files/s     RTF
   ----------------------------------------------------------------------------
-  Single WAV                                      1     0.17s     5.79   57.9x
-  Single MP3                                      1     0.17s     6.05   60.5x
-  Batch WAV 50 files (per-file)                  50     8.48s     5.89   44.4x
-  Batch MP3 50 files (per-file)                  50     8.53s     5.86   44.2x
-  Batch WAV dir (input_dir API)                  50     6.56s     7.63   57.5x
-  Batch MP3 dir (input_dir API)                  50     4.96s    10.08   76.0x
+  Single WAV                                      1     0.27s     3.70   37.0x
+  Single MP3                                      1     0.27s     3.66   36.6x
+  Batch WAV 50 files (per-file)                  50    13.54s     3.69   27.8x
+  Batch MP3 50 files (per-file)                  50    13.99s     3.57   26.9x
+  Batch WAV dir (input_dir API)                  50    10.64s     4.70   35.4x
+  Batch MP3 dir (input_dir API)                  50     8.84s     5.66   42.6x
 ```
 
 > [!TIP]
@@ -214,6 +214,53 @@ python3 stress_test.py --num_files 50 --compile --num_frames 1
 
 > [!NOTE]
 > Score variance between runs on the same file (std ≈ 0.22) is expected: with `num_repetitions=1` the model randomly crops a different window each time. Set `num_repetitions=5` for more stable scores at the cost of ~5× inference time.
+
+#### Accuracy
+
+1. Run UTMOSv2 using current implementation,
+
+```bash
+python3 benchmark_accuracy.py --audio_dir Elise_audio --num_files 100 \
+--num_repetitions 20 --out ours.csv
+```
+
+2. Run UTMOSv2 using original implementation,
+
+```bash
+pip3 install git+https://github.com/sarulab-speech/UTMOSv2 --target /tmp/utmos_orig --no-deps
+python3 benchmark_accuracy.py --audio_dir Elise_audio --num_files 100 \
+--num_repetitions 20 --out orig.csv --use_upstream /tmp/utmos_orig
+```
+
+3. Compare,
+
+```bash
+python3 benchmark_accuracy.py --compare ours.csv orig.csv
+```
+
+```
+Comparing A  vs  B
+  Common files   : 50
+  Pearson r      : 0.982328  (1.000 = perfect agreement)
+  MAE            : 0.085449
+  RMSE           : 0.105360
+  Mean bias      : +0.004355  (A minus B)
+
+  ✗ Notable differences — check which changes affect predictions.
+
+  Largest discrepancies (top 10):
+  File                                                      A        B         Δ
+  Elise-data-train-00000-of-00001_1026                 1.5771   1.3418   +0.2354
+  Elise-data-train-00000-of-00001_1002                 2.3203   2.0938   +0.2266
+  Elise-data-train-00000-of-00001_1001                 1.1816   1.4004   -0.2188
+  Elise-data-train-00000-of-00001_1030                 2.6836   2.9004   -0.2168
+  Elise-data-train-00000-of-00001_1027                 2.6641   2.4785   +0.1855
+  Elise-data-train-00000-of-00001_1036                 3.0879   2.9102   +0.1777
+  Elise-data-train-00000-of-00001_1005                 1.8662   1.6943   +0.1719
+  Elise-data-train-00000-of-00001_1038                 2.8242   2.9863   -0.1621
+  Elise-data-train-00000-of-00001_102                  1.9141   2.0664   -0.1523
+  Elise-data-train-00000-of-00001_1021                 1.1289   1.2637   -0.1348
+```
 
 ### Score consistency (same WAV file, 5 independent runs)
 

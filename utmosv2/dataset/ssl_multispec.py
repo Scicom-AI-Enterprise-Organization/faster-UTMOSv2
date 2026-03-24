@@ -8,7 +8,7 @@ import torch
 from utmosv2.dataset import MultiSpecDataset, SSLExtDataset
 from utmosv2.dataset._base import BaseDataset
 from utmosv2.dataset._utils import extend_audio, select_random_start
-from utmosv2.dataset.multi_spec import _make_melspec_torch, _make_spctrogram
+from utmosv2.dataset.multi_spec import _make_melspec_fast, _make_spctrogram
 
 if TYPE_CHECKING:
     from collections.abc import Callable
@@ -78,16 +78,17 @@ class SSLLMultiSpecExtDataset(BaseDataset):
             y1 = select_random_start(y_spec, spec_length)
             y1_t = torch.from_numpy(y1).unsqueeze(0)
             for i, spec_cfg in enumerate(self.cfg.dataset.specs):
-                mel_t = self.multi_spec._mel_transforms.get(i)
-                if mel_t is not None:
-                    spec = _make_melspec_torch(y1_t, mel_t, spec_cfg)
+                mel_fb = self.multi_spec._mel_filters.get(i)
+                stft_t = self.multi_spec._stft_transforms.get(i)
+                if mel_fb is not None and stft_t is not None:
+                    spec = _make_melspec_fast(y1_t, stft_t, mel_fb, spec_cfg)
                 else:
                     spec = _make_spctrogram(self.cfg, spec_cfg, y1)
-                if self.cfg.dataset.spec_frames.mixup_inner and self.phase == "train":
+                if self.cfg.dataset.spec_frames.mixup_inner:
                     y2 = select_random_start(y_spec, spec_length)
                     y2_t = torch.from_numpy(y2).unsqueeze(0)
-                    if mel_t is not None:
-                        spec2 = _make_melspec_torch(y2_t, mel_t, spec_cfg)
+                    if mel_fb is not None and stft_t is not None:
+                        spec2 = _make_melspec_fast(y2_t, stft_t, mel_fb, spec_cfg)
                     else:
                         spec2 = _make_spctrogram(self.cfg, spec_cfg, y2)
                     lmd = np.random.beta(
