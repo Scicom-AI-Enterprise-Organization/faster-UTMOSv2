@@ -24,6 +24,10 @@ Throughput stack (single GPU; the bottleneck is the CPU feature stack, not the G
     tensors are copied into pinned ring buffers and pushed async; batch N's finalize
     overlaps batch N+1's compute.
   * **bf16 autocast** (matches the library's inference autocast), TF32 matmuls.
+  * **GPU feature extraction** (FEATURE_DEVICE=cuda, the default): workers only
+    decode+silence-trim; the mel/STFT/resize stack runs batched on the GPU
+    (gpu_features.py) on its own stream, and only raw waveform crops cross PCIe.
+    FEATURE_DEVICE=cpu (or no CUDA) restores the process-pool feature path.
   * **Test-time augmentation.** UTMOSv2 draws random crops/mixup per pass; ?reps=N
     preprocesses N stochastic views and averages the scores (accuracy knob).
 
@@ -59,6 +63,12 @@ PREDICT_DATASET = os.environ.get("PREDICT_DATASET", "sarulab")
 _DTYPES = {"bf16": torch.bfloat16, "fp16": torch.float16, "fp32": torch.float32}
 DTYPE = _DTYPES[os.environ.get("DTYPE", "bf16")]
 DEV = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+# FEATURE_DEVICE=cuda (default) runs the mel/STFT feature stack on the GPU
+# (gpu_features.py): workers then only decode+silence-trim, and only raw waveform
+# crops cross PCIe. Set FEATURE_DEVICE=cpu for the process-pool CPU feature path;
+# without CUDA it falls back to that path automatically.
+FEATURE_DEVICE = os.environ.get("FEATURE_DEVICE", "cuda").lower()
+GPU_FEATURES = FEATURE_DEVICE.startswith("cuda") and DEV.type == "cuda"
 
 torch.backends.cuda.matmul.allow_tf32 = True
 torch.backends.cudnn.allow_tf32 = True
@@ -97,6 +107,13 @@ _AMP = DTYPE if DTYPE != torch.float32 else None
 
 log(f"[load] loaded. ssl_len={SSL_LEN} spec_imgs={SPEC_IMGS} ({N_FRAMES} frames x {N_SPECS} specs)")
 
+FEATURIZER = None
+if GPU_FEATURES:
+    from gpu_features import GpuFeaturizer
+
+    FEATURIZER = GpuFeaturizer(CFG, device=DEV)
+    log(f"[load] feature stack on {DEV} (FEATURE_DEVICE={FEATURE_DEVICE}); workers decode-only")
+
 
 def _forward(x1, x2, d):
     """(x1[B,ssl_len], x2[B,SPEC_IMGS,3,512,512], d[B,ndom]) -> MOS [B] float32."""
@@ -111,15 +128,18 @@ def _forward(x1, x2, d):
 _use_cuda = DEV.type == "cuda"
 if _use_cuda:
     S_COMP = torch.cuda.Stream()
-    _PIN_X1 = [torch.zeros(MAX_BATCH, SSL_LEN, dtype=torch.float32).pin_memory() for _ in range(RING)]
-    _PIN_X2 = [torch.zeros(MAX_BATCH, SPEC_IMGS, 3, SPEC_HW, SPEC_HW, dtype=torch.float32).pin_memory()
-               for _ in range(RING)]
-    _PIN_X1_NP = [t.numpy() for t in _PIN_X1]
-    _PIN_X2_NP = [t.numpy() for t in _PIN_X2]
-    _RING_EV = [torch.cuda.Event() for _ in range(RING)]
-    for e in _RING_EV:
-        e.record()
-    _ring = itertools.cycle(range(RING))
+    S_FEAT = torch.cuda.Stream() if GPU_FEATURES else None  # featurize never queues behind a forward
+    if not GPU_FEATURES:
+        # Pinned staging rings are only needed when finished spectrograms cross PCIe.
+        _PIN_X1 = [torch.zeros(MAX_BATCH, SSL_LEN, dtype=torch.float32).pin_memory() for _ in range(RING)]
+        _PIN_X2 = [torch.zeros(MAX_BATCH, SPEC_IMGS, 3, SPEC_HW, SPEC_HW, dtype=torch.float32).pin_memory()
+                   for _ in range(RING)]
+        _PIN_X1_NP = [t.numpy() for t in _PIN_X1]
+        _PIN_X2_NP = [t.numpy() for t in _PIN_X2]
+        _RING_EV = [torch.cuda.Event() for _ in range(RING)]
+        for e in _RING_EV:
+            e.record()
+        _ring = itertools.cycle(range(RING))
 
 GPU = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="gpu")
 CPU = concurrent.futures.ThreadPoolExecutor(max_workers=CPU_WORKERS, thread_name_prefix="cpu")
@@ -130,7 +150,8 @@ try:
 
     PP = (concurrent.futures.ProcessPoolExecutor(
               max_workers=PP_WORKERS, mp_context=mp.get_context("spawn"),
-              initializer=preprocess_worker.init, initargs=(CONFIG, PREDICT_DATASET))
+              initializer=preprocess_worker.init,
+              initargs=(CONFIG, PREDICT_DATASET, GPU_FEATURES))
           if PP_WORKERS > 0 else None)
 except Exception as _e:
     PP = None
@@ -143,10 +164,36 @@ STATS = {"requests": 0, "batches": 0, "batched_items": 0, "gpu_ms_sum": 0.0, "ma
 # --------------------------------------------------------------------------- #
 # GPU thread: build batch, launch async, return a handle (no host sync)
 # --------------------------------------------------------------------------- #
+def _gpu_featurize(audio, dataset_name, reps):
+    """Run the GPU feature stack on the dedicated GPU thread, on its own stream.
+
+    Returns (x1, x2, d, ev): device tensors plus the event marking their readiness;
+    _submit makes the compute stream wait on it before consuming the tensors.
+    """
+    with torch.cuda.stream(S_FEAT):
+        x1, x2, d = FEATURIZER.featurize(audio, dataset_name, reps)
+        ev = torch.cuda.Event()
+        ev.record(S_FEAT)
+    return x1, x2, d, ev
+
+
 def _submit(items):
     """Stack sub-items into one batch, push H2D + compute, record a done event. No host sync."""
     t0 = time.perf_counter()
     b = len(items)
+    if _use_cuda and GPU_FEATURES:
+        # Features are already on-device tensors; order compute after their featurize events.
+        with torch.cuda.stream(S_COMP):
+            for ev in {id(it["ev"]): it["ev"] for it in items}.values():
+                S_COMP.wait_event(ev)
+            x1 = torch.stack([it["x1"] for it in items])
+            x2 = torch.stack([it["x2"] for it in items])
+            d = torch.stack([it["d"] for it in items])
+            out = _forward(x1, x2, d)
+            out_cpu = out.to("cpu", non_blocking=True)
+            ev = torch.cuda.Event()
+            ev.record(S_COMP)
+        return {"items": items, "out": out_cpu, "ev": ev, "t0": t0}
     if _use_cuda:
         k = next(_ring)
         _RING_EV[k].synchronize()                       # slot k drained -> safe to reuse pinned buffers
@@ -283,13 +330,24 @@ async def _startup():
             _t = np.arange(CFG.sr, dtype="float32") / CFG.sr
             sf.write(sil, (0.3 * np.sin(2 * np.pi * 220 * _t)).astype("float32"), CFG.sr, format="WAV")
             blob = sil.getvalue()
-            await asyncio.gather(*[
-                loop.run_in_executor(PP, preprocess_worker.preprocess, blob, PREDICT_DATASET, 1)
-                for _ in range(PP_WORKERS)
-            ])
+            if GPU_FEATURES:
+                await asyncio.gather(*[
+                    loop.run_in_executor(PP, preprocess_worker.decode_clean, blob)
+                    for _ in range(PP_WORKERS)
+                ])
+            else:
+                await asyncio.gather(*[
+                    loop.run_in_executor(PP, preprocess_worker.preprocess, blob, PREDICT_DATASET, 1)
+                    for _ in range(PP_WORKERS)
+                ])
             log(f"[startup] preprocessing ProcessPool ready ({PP_WORKERS} workers)")
         except Exception as e:
             log(f"[startup] ProcessPool warm failed: {e}")
+    if GPU_FEATURES:                                     # prime cuFFT plans + resize kernels
+        _t = np.arange(CFG.sr, dtype="float32") / CFG.sr
+        tone = (0.1 * np.sin(2 * np.pi * 220 * _t)).astype("float32")
+        await loop.run_in_executor(GPU, _gpu_featurize, tone, PREDICT_DATASET, 1)
+        log("[startup] GPU featurizer warmed")
     asyncio.create_task(_batch_loop())
     log("[startup] ready")
 
@@ -299,6 +357,7 @@ async def health():
     return {"ok": True, "config": CONFIG, "fold": FOLD, "dtype": str(DTYPE),
             "device": str(DEV), "max_batch": MAX_BATCH, "max_wait_ms": MAX_WAIT_MS,
             "num_frames": N_FRAMES, "spec_imgs": SPEC_IMGS,
+            "feature_device": str(DEV) if GPU_FEATURES else "cpu",
             "pp_workers": PP_WORKERS if PP is not None else 0}
 
 
@@ -324,14 +383,20 @@ async def predict(
     loop = asyncio.get_event_loop()
     ds = dataset or PREDICT_DATASET
     exec_ = PP if PP is not None else CPU
-    x1, x2, d = await loop.run_in_executor(exec_, preprocess_worker.preprocess, raw, ds, reps)
+    if GPU_FEATURES:
+        # workers decode+trim only; the mel/STFT stack runs batched on the GPU
+        audio = await loop.run_in_executor(exec_, preprocess_worker.decode_clean, raw)
+        x1, x2, d, fev = await loop.run_in_executor(GPU, _gpu_featurize, audio, ds, reps)
+    else:
+        x1, x2, d = await loop.run_in_executor(exec_, preprocess_worker.preprocess, raw, ds, reps)
+        fev = None
 
     req = {"reps": x1.shape[0], "got": 0, "acc": 0.0,
            "fut": loop.create_future(), "loop": loop}
     STATS["requests"] += 1
     t0 = time.perf_counter()
     for i in range(x1.shape[0]):                          # enqueue each TTA view as a sub-item
-        await Q.put({"x1": x1[i], "x2": x2[i], "d": d[i], "req": req})
+        await Q.put({"x1": x1[i], "x2": x2[i], "d": d[i], "ev": fev, "req": req})
     await req["fut"]
     total_ms = (time.perf_counter() - t0) * 1000
     return JSONResponse({

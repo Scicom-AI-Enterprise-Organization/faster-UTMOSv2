@@ -35,17 +35,24 @@ _DATASET = None  # a reusable dataset instance (mel filters / stft transforms ca
 _FE_SR = 16000
 
 
-def init(config: str = "fusion_stage3", predict_dataset: str = "sarulab") -> None:
+def init(config: str = "fusion_stage3", predict_dataset: str = "sarulab",
+         decode_only: bool = False) -> None:
     """ProcessPool initializer: runs in each WORKER process only.
 
     Blank the GPU, then build the UTMOSv2 config + a single dataset instance whose
     mel filter banks and torchaudio STFT transforms are pre-cached (the expensive
     part of dataset construction).  Per request we only swap the in-memory audio.
+
+    With ``decode_only=True`` (server runs FEATURE_DEVICE=cuda) the workers only ever
+    run `decode_clean`, so the dataset build is skipped entirely.
     """
     global _CFG, _DATASET
     os.environ["CUDA_VISIBLE_DEVICES"] = ""            # workers must never grab the GPU
     os.environ.setdefault("OMP_NUM_THREADS", "1")      # spectrograms are single-threaded; parallelism is across procs
     os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
+
+    if decode_only:
+        return
 
     import torch
 
@@ -88,6 +95,32 @@ def _decode(raw: bytes) -> np.ndarray:
             import librosa
 
             audio = librosa.resample(audio, orig_sr=sr, target_sr=_FE_SR).astype("float32")
+    return np.ascontiguousarray(audio, dtype="float32")
+
+
+def _fallback_tone() -> np.ndarray:
+    """1 s audible 220 Hz tone: the guard for empty/all-silence clips (matches the
+    CPU path's fallback so such requests return a meaningless score, not a 500)."""
+    t = np.arange(_FE_SR, dtype="float32") / _FE_SR
+    return (0.1 * np.sin(2 * np.pi * 220 * t)).astype("float32")
+
+
+def decode_clean(raw: bytes) -> np.ndarray:
+    """bytes -> mono float32 @ 16 kHz with silent sections removed.
+
+    The worker-side half of the FEATURE_DEVICE=cuda path: decode + silence removal
+    stay in the process pool (CPU), the mel/STFT stack runs batched on the GPU in
+    the server process (see gpu_features.py). Applies the same guards as
+    `preprocess`: too-short or silence-emptied clips fall back to a low tone.
+    """
+    from utmosv2.preprocess._preprocess import remove_silent_section
+
+    audio = _decode(raw)
+    if audio.size < _FE_SR // 10:
+        return _fallback_tone()
+    audio = remove_silent_section(audio)
+    if audio.size == 0:
+        return _fallback_tone()
     return np.ascontiguousarray(audio, dtype="float32")
 
 
